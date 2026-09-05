@@ -63,6 +63,11 @@ msg() {
 # ---------------------------------------------------------------------------
 [[ $EUID != 0 ]] && err "当前非 ${yellow}ROOT用户.${none}"
 
+# 防 Windows 换行符: 脚本被 CRLF 污染时, 所有 heredoc 都会写坏(如 systemd unit 导致 203/EXEC)
+if grep -q $'\r' "$0" 2>/dev/null; then
+    err "脚本包含 Windows 换行符(CRLF), 先执行: ${green}sed -i 's/\r\$//' $0${none} 再重新运行"
+fi
+
 cmd=$(type -P apt-get || type -P yum)
 [[ ! $cmd ]] && err "此脚本仅支持 ${yellow}(Ubuntu or Debian or CentOS)${none}."
 
@@ -554,6 +559,18 @@ RestrictSUIDSGID=true
 [Install]
 WantedBy=multi-user.target
 EOF
+    # 防 CRLF 污染单元文件(经 Windows 拷贝/编辑的场景)
+    sed -i 's/\r$//' /etc/systemd/system/xray.service
+    # SELinux 强制模式下给二进制打 bin_t 标签, 否则 systemd 无法执行, 服务 203/EXEC 崩溃循环
+    if command -v getenforce >/dev/null 2>&1 && [[ $(getenforce) == Enforcing ]]; then
+        if command -v semanage >/dev/null 2>&1; then
+            semanage fcontext -a -t bin_t "/etc/xray/bin(/.*)?" &>/dev/null
+            restorecon -Rv /etc/xray/bin &>/dev/null
+        elif command -v chcon >/dev/null 2>&1; then
+            chcon -t bin_t $is_core_bin &>/dev/null \
+                || warn "SELinux 标签设置失败, 若服务起不来请手动执行: chcon -t bin_t $is_core_bin"
+        fi
+    fi
     systemctl daemon-reload
     systemctl enable xray &>/dev/null
     systemctl start xray
@@ -567,10 +584,23 @@ EOF
         sleep 0.5
     done
     [[ $ok == 1 ]] || {
-        systemctl status xray --no-pager -l 2>/dev/null | tail -20
-        err "Xray 启动失败, 请检查上方日志"
+        journalctl -u xray -n 20 --no-pager 2>/dev/null | tail -20
+        err "Xray 启动失败(常见: SELinux 的 203/EXEC、端口被占), 按上方日志处理后: systemctl restart xray"
     }
-    msg ok "Xray 服务已启动"
+    # active 不等于端口真的在监听, 再确认一次
+    local listen_ok=0
+    for i in {1..10}; do
+        ss -ltn 2>/dev/null | grep -q ":$port " && {
+            listen_ok=1
+            break
+        }
+        sleep 0.5
+    done
+    [[ $listen_ok == 1 ]] || {
+        journalctl -u xray -n 20 --no-pager 2>/dev/null | tail -20
+        err "Xray 已 active 但端口 $port 未监听, 按上方日志排查"
+    }
+    msg ok "Xray 服务已启动, 端口 $port 监听中"
 }
 
 # ---------------------------------------------------------------------------
