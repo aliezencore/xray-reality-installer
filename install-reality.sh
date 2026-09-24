@@ -17,7 +17,12 @@
 #        [--https-proxy] [--https-proxy-port 3128]
 #        [--proxy http://127.0.0.1:2333] [--version v25.x.x]
 #
-# 装完后管理命令: xray {start|stop|restart|status|info|log|config|test|update|uninstall}
+# 端口:
+#   很多 VPS 商家只在安全组里放行了少数端口, 所以交互终端下运行且未给 --port 时,
+#   脚本会提示输入端口(填你已放行的那个), 端口被占用也会重新询问而不是直接退出;
+#   管道/CI 等非交互环境不提示, 直接用 --port 或默认 443。
+#
+# 装完后管理命令: xray {start|stop|restart|status|info|log|loglevel|conn|config|test|bbr|update|uninstall}
 
 # ---------------------------------------------------------------------------
 # 颜色与输出 (沿用原脚本风格)
@@ -104,6 +109,9 @@ hp_enabled=""
 hp_port=""
 hp_user=""
 hp_pass=""
+
+# 交互式端口输入的返回值 (见 ask_port_value)
+_picked=""
 
 # ---------------------------------------------------------------------------
 # 小工具
@@ -353,17 +361,125 @@ open_firewall() {
 }
 
 # ---------------------------------------------------------------------------
+# BBR 状态检测: 打印诊断信息, 返回 0 表示已启用
+# 判据是内核当前实际生效的拥塞控制算法, 而不是"配置文件写了没有"
+# ---------------------------------------------------------------------------
+bbr_check() {
+    local kver cc avail qdisc
+    kver=$(uname -r)
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    # 去掉可能的空白, 避免 sysctl 输出带杂质时把 == 比较搞失败
+    cc=${cc//[[:space:]]/}
+    qdisc=${qdisc//[[:space:]]/}
+
+    echo -e "  内核版本 : ${green}${kver:-未知}${none}"
+    echo -e "  当前算法 : ${green}${cc:-读取失败}${none}"
+    echo -e "  可用算法 : ${gray}${avail:-读取失败}${none}"
+    echo -e "  队列算法 : ${gray}${qdisc:-读取失败}${none}"
+
+    [[ $cc == bbr ]] || return 1
+    [[ $qdisc == fq || $qdisc == fq_codel ]] || \
+        warn "队列算法是 ${qdisc:-空}, 建议设为 fq —— BBR 的配套队列, 不带 fq 效果会打折"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # BBR 优化 (sysctl.d 持久化, 幂等)
 # ---------------------------------------------------------------------------
 enable_bbr() {
+    msg warn "检查 BBR ..."
+    if bbr_check; then
+        msg ok "BBR 已开启"
+        return
+    fi
+
     cat >/etc/sysctl.d/99-xray-bbr.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
     sysctl -p /etc/sysctl.d/99-xray-bbr.conf >/dev/null 2>&1
-    local mode
-    mode=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    [[ $mode == bbr ]] && msg ok "BBR 已开启" || warn "BBR 开启失败(内核可能不支持), 不影响使用"
+
+    if bbr_check; then
+        msg ok "BBR 已开启 (配置已写入 /etc/sysctl.d/99-xray-bbr.conf, 重启后依然生效)"
+        return
+    fi
+
+    # 未生效时区分两种原因, 而不是笼统地说"内核不支持"
+    if [[ $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) != *bbr* ]]; then
+        warn "内核不支持 BBR(可用算法列表里没有 bbr), 不影响 REALITY 使用"
+        warn "  需要内核 >= 4.9; 若为 OpenVZ/LXC 等共享宿主内核的容器, 宿主机不换内核就无法开启"
+    else
+        warn "内核支持 BBR 但设置未生效, 手动执行看具体报错(常见: 容器内 /proc/sys 只读):"
+        echo -e "  ${green}sysctl -w net.ipv4.tcp_congestion_control=bbr${none}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 交互式端口输入 (结果写入全局 _picked)
+#   $1 提示语  $2 默认值(为空表示必填)  $3 端口用途(报错文案)  $4 需排除的端口(可选)
+# 注意: 提示与错误信息一律走 stderr, 避免污染调用方的输出
+# ---------------------------------------------------------------------------
+ask_port_value() {
+    local tip=$1 def=$2 label=${3:-端口} exclude=${4:-} ans
+    while :; do
+        if [[ $def ]]; then
+            read -r -p "$tip [默认 $def]: " ans || return 1
+        else
+            read -r -p "$tip (1-65535): " ans || return 1
+        fi
+        ans=${ans// /}
+        # 去掉 CR/TAB: Windows 终端粘贴或 CRLF 环境可能带进来, 否则会被判成非法输入
+        ans=${ans//$'\r'/}
+        ans=${ans//$'\t'/}
+        [[ -z $ans && $def ]] && ans=$def
+        # 长度先卡一道, 防止超长数字在 10# 运算里溢出后"碰巧"落在合法区间
+        if [[ ${#ans} -gt 5 || ! $ans =~ ^[0-9]+$ ]] || (( 10#$ans < 1 || 10#$ans > 65535 )); then
+            echo -e "${yellow}$label 无效: ${ans:-空}, 请输入 1-65535 之间的数字${none}" >&2
+            continue
+        fi
+        ans=$((10#$ans))
+        if [[ -n $exclude && $ans == "$exclude" ]]; then
+            echo -e "${yellow}$label 不能与 REALITY 监听端口相同 ($exclude)${none}" >&2
+            continue
+        fi
+        if ! check_port "$ans"; then
+            echo -e "${yellow}$label $ans 已被占用, 请换一个${none}" >&2
+            continue
+        fi
+        _picked=$ans
+        return 0
+    done
+}
+
+# ---------------------------------------------------------------------------
+# 主监听端口: --port 优先; 交互终端下提示输入; 非交互环境用默认 443
+# 商家安全组只放行部分端口时, 必须让用户自己填, 不能替他随机挑
+# ---------------------------------------------------------------------------
+ask_port() {
+    if [[ $port ]]; then
+        if check_port "$port"; then
+            msg ok "REALITY 监听端口: $port"
+            return 0
+        fi
+        if [[ -t 0 ]]; then
+            warn "端口 $port 已被占用, 请重新指定"
+            port=""
+        else
+            err "端口 $port 已被占用, 请用 --port 指定其他端口"
+        fi
+    fi
+    if [[ -t 0 ]]; then
+        echo
+        echo -e "${cyan}提示: 多数 VPS 商家只在安全组放行了少数端口, 请填写你已放行的端口${none}"
+        ask_port_value "请输入 REALITY 监听端口" 443 "端口" || err "读取端口失败"
+        port=$_picked
+    else
+        port=443
+        msg warn "非交互环境且未指定 --port, 使用默认端口 443"
+    fi
+    msg ok "REALITY 监听端口: $port"
 }
 
 # ---------------------------------------------------------------------------
@@ -371,24 +487,40 @@ EOF
 # 交互终端下询问; 非交互环境(自动化)用 --https-proxy / --https-proxy-port 启用
 # ---------------------------------------------------------------------------
 ask_https_proxy() {
+    local ans
     if [[ $hp_enabled ]]; then
         :
     elif [[ -t 0 ]]; then
         echo
-        read -r -p "是否附加安装一个 HTTPS 正向代理? (https://ip:port, 可供 curl/程序挂代理用, 端口随机+账号密码随机) [y/N]: " ans
+        read -r -p "是否附加安装一个 HTTPS 正向代理? (https://ip:port, 可供 curl/程序挂代理用, 账号密码随机) [y/N]: " ans
+        ans=${ans// /}
+        ans=${ans//$'\r'/}
         [[ $ans == y || $ans == Y || $ans == yes || $ans == YES ]] && hp_enabled=1
     else
         msg warn "非交互环境, 跳过 HTTPS 正向代理 (如需安装请加参数 --https-proxy)"
     fi
     if [[ $hp_enabled ]]; then
         if [[ ! $hp_port ]]; then
-            local tries=0
-            while :; do
-                hp_port=$(( (RANDOM % 40000) + 20000 ))
-                check_port "$hp_port" && break
-                (( tries++ >= 50 )) && err "找不到空闲的 HTTPS 代理端口, 请用 --https-proxy-port 指定"
+            # 先挑一个随机空闲端口(且不与主端口冲突)作为默认值
+            local rand_port="" tries=0
+            while (( tries < 50 )); do
+                rand_port=$(( (RANDOM % 40000) + 20000 ))
+                [[ $rand_port != "$port" ]] && check_port "$rand_port" && break
+                rand_port=""
+                (( tries++ ))
             done
+            if [[ -t 0 ]]; then
+                # 交互模式: 回车用随机端口, 也可填写商家已放行的端口
+                ask_port_value "请输入 HTTPS 代理端口" "$rand_port" "HTTPS 代理端口" "$port" \
+                    || err "读取 HTTPS 代理端口失败"
+                hp_port=$_picked
+            else
+                [[ -z $rand_port ]] && err "找不到空闲的 HTTPS 代理端口, 请用 --https-proxy-port 指定"
+                hp_port=$rand_port
+            fi
         fi
+        [[ $hp_port == "$port" ]] && err "HTTPS 代理端口与主端口相同: $port"
+        check_port "$hp_port" || err "HTTPS 代理端口 $hp_port 已被占用, 请用 --https-proxy-port 指定其他端口"
         msg ok "HTTPS 正向代理: 端口 $hp_port (账号密码安装时随机生成)"
     fi
 }
@@ -516,7 +648,7 @@ ShortId (sid)     : $short_id
 $link
 
 说明: 伪装站点为 $sni:443, 非 REALITY 流量会自动透明回落至该站点。
-管理命令: xray {start|stop|restart|status|info|log|config|test|update|uninstall}
+管理命令: xray {start|stop|restart|status|info|log|loglevel|conn|config|test|bbr|update|uninstall}
 ====================================================
 EOF
     if [[ $hp_enabled ]]; then
@@ -621,31 +753,165 @@ usage() {
   start      启动 Xray
   stop       停止 Xray
   restart    重启 Xray
-  status     查看运行状态
+  status     查看运行状态(服务/监听端口/在线连接/重启次数)
   info       查看节点信息和客户端链接
   log        跟踪查看日志 (journalctl)
+  loglevel   查看或设置日志级别 (排障先设为 info)
+  conn       列出当前已建立的连接
   config     查看当前配置
   test       校验配置
+  bbr        查看 BBR 加速状态(拥塞控制/队列算法)
   update     更新 Xray 到最新版 (含 geo 数据)
   uninstall  卸载 Xray (停止服务并删除文件)
 HELP
 }
 
 case $1 in
-start | stop | restart | status)
+start | stop | restart)
     systemctl $1 xray
+    ;;
+status)
+    systemctl status xray --no-pager -l 2>/dev/null | head -12
+    echo
+    if systemctl is-active -q xray 2>/dev/null; then
+        echo "--- 运行详情 ---"
+        echo "  启动时间 : $(systemctl show xray -p ActiveEnterTimestamp --value 2>/dev/null)"
+        echo "  重启次数 : $(systemctl show xray -p NRestarts --value 2>/dev/null)"
+        lv=$(command -v jq >/dev/null 2>&1 && jq -r '.log.loglevel // "warning"' $conf 2>/dev/null)
+        echo "  日志级别 : ${lv:-未知}    (改级别: xray loglevel info)"
+        port=$(command -v jq >/dev/null 2>&1 && jq -r '.inbounds[0].port // empty' $conf 2>/dev/null)
+        if [[ $port ]] && command -v ss >/dev/null 2>&1; then
+            # active 不代表端口真的在听, 所以单独确认一次
+            if ss -ltn 2>/dev/null | grep -q ":$port "; then
+                echo "  监听端口 : $port (监听中)"
+            else
+                echo "  监听端口 : $port (未监听! 执行 xray log 看日志)"
+            fi
+            echo "  在线连接 : $(ss -tn state established "sport = :$port" 2>/dev/null | grep -c ESTAB) 条"
+        fi
+    else
+        echo "服务未运行: xray start 启动; 启动失败请看 xray log"
+    fi
     ;;
 info)
     [[ -f $info ]] && cat $info || echo "节点信息文件不存在: $info"
     ;;
 log)
+    lv=$(command -v jq >/dev/null 2>&1 && jq -r '.log.loglevel // "warning"' $conf 2>/dev/null)
+    echo "当前日志级别: ${lv:-未知}"
+    case $lv in
+    none | error | warning)
+        echo "提示: 该级别下正常运行几乎不产生日志 —— 看不到内容不代表没连上。"
+        echo "      排障请先执行: xray loglevel info"
+        ;;
+    esac
+    echo "--- journalctl -u xray -n 80 -f (Ctrl-C 退出) ---"
     journalctl -u xray -n 80 -f
+    ;;
+loglevel)
+    cur=$(command -v jq >/dev/null 2>&1 && jq -r '.log.loglevel // "warning"' $conf 2>/dev/null)
+    if [[ -z $2 ]]; then
+        echo "当前日志级别: ${cur:-未知}"
+        echo
+        echo "用法: xray loglevel <级别>"
+        echo "  none     完全静默"
+        echo "  error    只记错误"
+        echo "  warning  默认值, 正常运行几乎无输出"
+        echo "  info     记录连接与出站选择, 排障用这个"
+        echo "  debug    最详细, 仅短期排查"
+        echo
+        echo "排查完记得改回 warning, 免得日志刷爆磁盘"
+        exit 0
+    fi
+    case $2 in
+    none | error | warning | info | debug) ;;
+    *)
+        echo "无效日志级别: $2 (可选 none/error/warning/info/debug)"
+        exit 1
+        ;;
+    esac
+    command -v jq >/dev/null 2>&1 || {
+        echo "缺少 jq, 无法修改配置"
+        exit 1
+    }
+    # 改配置必须: 写临时文件 -> 自检 -> 原子替换, 避免改坏线上配置
+    jq --arg lv "$2" '.log.loglevel = $lv' $conf >$conf.tmp 2>/dev/null || {
+        echo "生成新配置失败"
+        rm -f $conf.tmp
+        exit 1
+    }
+    chmod 600 $conf.tmp
+    $bin run -test -config $conf.tmp >/dev/null 2>&1 || {
+        echo "新配置自检未通过, 已放弃修改"
+        rm -f $conf.tmp
+        exit 1
+    }
+    mv -f $conf.tmp $conf
+    systemctl restart xray
+    sleep 1
+    if systemctl is-active -q xray; then
+        echo "日志级别已设为 $2, 服务已重启; 查看日志: xray log"
+    else
+        echo "服务重启后异常, 请查看: journalctl -u xray -n 50"
+        exit 1
+    fi
+    ;;
+conn)
+    command -v jq >/dev/null 2>&1 || {
+        echo "缺少 jq, 无法读取监听端口"
+        exit 1
+    }
+    port=$(jq -r '.inbounds[0].port // empty' $conf 2>/dev/null)
+    [[ -z $port ]] && {
+        echo "未能从 $conf 读到监听端口"
+        exit 1
+    }
+    command -v ss >/dev/null 2>&1 || {
+        echo "缺少 ss 命令(iproute2)"
+        exit 1
+    }
+    echo "端口 $port 上的已建立连接:"
+    ss -tn state established "sport = :$port" 2>/dev/null | awk 'NR>1 && $1=="ESTAB" {printf "  %-24s <- %s\n", $4, $5}'
+    echo "共 $(ss -tn state established "sport = :$port" 2>/dev/null | grep -c ESTAB) 条"
     ;;
 config)
     cat $conf
     ;;
 test)
     $bin run -test -config $conf
+    ;;
+bbr)
+    # 与安装脚本里的 bbr_check 逻辑保持一致(此文件为独立脚本, 不共享函数)
+    echo "BBR 状态:"
+    echo "  内核版本 : $(uname -r)"
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    cc=${cc//[[:space:]]/}
+    avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    qdisc=${qdisc//[[:space:]]/}
+    echo "  当前算法 : ${cc:-读取失败}"
+    echo "  可用算法 : ${avail:-读取失败}"
+    echo "  队列算法 : ${qdisc:-读取失败}"
+    if command -v ss >/dev/null 2>&1; then
+        # 只看 Xray 监听端口上的连接 —— 改 sysctl 不会切换老连接, 这才是"我的隧道在用哪个"
+        port=$(command -v jq >/dev/null 2>&1 && jq -r '.inbounds[0].port // empty' $conf 2>/dev/null)
+        if [[ $port ]]; then
+            real=$(ss -tin state established "sport = :$port" 2>/dev/null | grep -oE '\b(bbr2|bbr|cubic|reno|htcp|vegas|dctcp)\b' | head -1)
+            [[ $real ]] && echo "  连接实测 : $real (端口 $port 上的已建立连接)" \
+                || echo "  连接实测 : 端口 $port 上暂无已建立连接"
+        else
+            real=$(ss -tin 2>/dev/null | grep -oE '\b(bbr2|bbr|cubic|reno|htcp|vegas|dctcp)\b' | head -1)
+            [[ $real ]] && echo "  连接实测 : $real (全部已建立连接, 未能读到监听端口)"
+        fi
+    fi
+    if [[ $cc == bbr ]]; then
+        echo "  => BBR 已开启"
+        [[ $qdisc == fq || $qdisc == fq_codel ]] || echo "     注意: 队列算法建议设为 fq, 否则 BBR 效果会打折"
+    else
+        echo "  => BBR 未开启"
+        echo "     修复: echo -e 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr' > /etc/sysctl.d/99-bbr.conf && sysctl -p /etc/sysctl.d/99-bbr.conf"
+        echo "     若报错: 多为容器内 /proc/sys 只读, 或内核低于 4.9 不支持"
+    fi
     ;;
 update)
     arch=$(uname -m)
@@ -712,14 +978,19 @@ EOF
 show_help() {
     cat <<HELP
 用法: bash $0 [选项]
-  -p, --port <port>          监听端口 (默认 443)
+  -p, --port <port>          监听端口 (默认 443; 交互安装时未指定会提示输入)
   -s, --sni <domain>         指定 REALITY 伪装站点域名 (默认自动探测)
   -n, --name <name>          节点名称 (默认 VPS-REALITY)
   -v, --version <ver>        指定 Xray 版本, e.g. v25.1.1 (默认 latest)
   -x, --proxy <addr>         使用代理下载, e.g. -x http://127.0.0.1:2333
       --https-proxy          附加安装 HTTPS 正向代理 (https://user:pass@ip:port)
-      --https-proxy-port <p> 指定 HTTPS 代理端口 (默认随机, 隐含 --https-proxy)
+      --https-proxy-port <p> 指定 HTTPS 代理端口 (隐含 --https-proxy; 交互模式回车用随机端口)
   -h, --help                 显示此帮助
+
+端口说明:
+  多数 VPS 商家只在安全组里放行了少数端口, 请填你已放行的端口。
+  交互终端下未指定 --port 时会提示输入(回车用 443), 端口被占用会重新询问;
+  管道/CI 等非交互环境不提示, 直接用 --port 或默认 443。
 
 示例:
   bash install-reality.sh
@@ -792,9 +1063,6 @@ main() {
     [[ -f /etc/xray/bin/xray ]] && err "检测到 Xray 已安装, 如需重装请先执行: ${green}xray uninstall${none}"
     [[ -f /usr/local/bin/v2ray ]] && warn "检测到旧版 V2Ray, 建议先卸载旧 v2ray 再安装, 避免端口冲突"
 
-    # 默认端口
-    port=${port:-443}
-
     clear
     echo
     echo "........... Xray VLESS+REALITY 一键安装 ..........."
@@ -804,22 +1072,19 @@ main() {
     [[ $core_ver ]] && msg warn "Xray 版本: ${yellow}$core_ver${none}"
     [[ $proxy ]] && msg warn "使用代理: ${yellow}$proxy${none}"
 
+    # 端口: --port 优先, 交互终端下提示输入(端口被占用会重新询问)
+    # 放在依赖安装之前, 避免用户等着装依赖才被问
+    ask_port
+
+    # HTTPS 正向代理: 交互终端下询问, 非交互环境用 --https-proxy 启用
+    ask_https_proxy
+
     # 时间同步 (失败仅警告, REALITY 不依赖精确时间, 但 TLS 需要)
     timedatectl set-ntp true &>/dev/null || warn "无法设置自动同步时间, 不影响 REALITY 使用, 但建议修复"
 
     # 依赖
     install_pkg wget unzip openssl
     install_jq
-
-    # HTTPS 正向代理: 交互终端下询问, 非交互环境用 --https-proxy 启用
-    ask_https_proxy
-    [[ $hp_enabled && "$hp_port" == "$port" ]] && err "HTTPS 代理端口与主端口相同: $port"
-
-    # 端口占用检测
-    check_port "$port" || err "端口 $port 已被占用, 请用 --port 指定其他端口"
-    [[ $hp_enabled ]] && {
-        check_port "$hp_port" || err "HTTPS 代理端口 $hp_port 已被占用, 请用 --https-proxy-port 指定其他端口"
-    }
 
     # 下载 Xray
     download_core
@@ -841,8 +1106,11 @@ main() {
     # 防火墙放行
     if [[ $hp_enabled ]]; then
         open_firewall "$port" "$hp_port"
+        # 商家安全组独立于系统防火墙, 脚本无法自动放行, 明确提示避免装完连不上
+        msg warn "如你的 VPS 商家有安全组/防火墙面板, 请确认已放行 TCP 端口: $port $hp_port"
     else
         open_firewall "$port"
+        msg warn "如你的 VPS 商家有安全组/防火墙面板, 请确认已放行 TCP 端口: $port"
     fi
 
     # BBR 优化
@@ -859,7 +1127,7 @@ main() {
     printf '=%.0s' {1..78}
     echo
     msg ok "安装完成! 节点信息已保存到 $info_file"
-    msg ok "日常管理: ${yellow}xray {start|stop|restart|status|info|log|config|test|update|uninstall}${none}"
+    msg ok "日常管理: ${yellow}xray {start|stop|restart|status|info|log|loglevel|conn|config|test|bbr|update|uninstall}${none}"
     echo
 }
 
