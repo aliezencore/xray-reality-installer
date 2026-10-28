@@ -2,20 +2,29 @@
 
 单脚本同时支持 **Ubuntu / Debian / CentOS**(自动识别 `apt-get` / `yum`,无需分版本),管理命令内置,不依赖任何远程管理脚本。基于 233boy/v2ray 框架改造,核心为 Xray REALITY。
 
+## 仓库里有什么
+
+| 脚本 | 协议 | 说明 |
+|---|---|---|
+| `install-reality.sh` | VLESS + REALITY(TCP/443) | 本文档介绍的主角,抗封锁强、基于 TCP |
+| `install-hysteria2.sh` | Hysteria2(QUIC/UDP) | 弱网/跨境线路表现更好,只跑 UDP,见 [README-hysteria2.md](README-hysteria2.md) |
+
+两者互不干扰,可以在同一台机器上共存(端口不同即可)。
+
 ## 快速部署
 
 在全新服务器上(Ubuntu 20.04+ / Debian 11+ / CentOS 7+,root 运行):
 
 ```bash
 # 交互式(会询问是否附加 HTTPS 正向代理)
-bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/xray-reality-installer/main/install-reality.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/aliezencore/xray-reality-installer/main/install-reality.sh)
 
 # 带参数(注意参数直接跟在后面)
-bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/xray-reality-installer/main/install-reality.sh) --https-proxy --port 8443
+bash <(curl -fsSL https://raw.githubusercontent.com/aliezencore/xray-reality-installer/main/install-reality.sh) --https-proxy --port 8443
 
 # 或者先下载再执行(CentOS 最小装也可用 wget)
-curl -fsSL https://raw.githubusercontent.com/<你的用户名>/xray-reality-installer/main/install-reality.sh -o ir.sh && bash ir.sh
-wget -q https://raw.githubusercontent.com/<你的用户名>/xray-reality-installer/main/install-reality.sh -O ir.sh && bash ir.sh
+curl -fsSL https://raw.githubusercontent.com/aliezencore/xray-reality-installer/main/install-reality.sh -o ir.sh && bash ir.sh
+wget -q https://raw.githubusercontent.com/aliezencore/xray-reality-installer/main/install-reality.sh -O ir.sh && bash ir.sh
 ```
 
 > 通过管道/CI 非交互运行时,HTTPS 代理询问会自动跳过,需要时加 `--https-proxy` 参数。
@@ -74,3 +83,14 @@ xray {start|stop|restart|status|info|log|config|test|update|uninstall}
 - 需要 root;443 被占用时脚本会提示改用 `--port`
 - 卸载:`xray uninstall`(服务、配置、证书、管理命令一并清理)
 - 仓库仅含本脚本,无任何密钥/配置数据
+
+## 另一个脚本:Hysteria2
+
+`install-hysteria2.sh` 是同一套思路的 Hysteria2 版本(移植自 `app_hysteria2.py`):`hysteria` 二进制自举 + `hashes.txt` SHA256 校验 + `hysteria cert` 自签证书 + 配置试启动自检 + systemd 常驻 + 自动放行 UDP + BBR,装完给 `hy2` 管理命令与客户端链接。
+
+```bash
+bash install-hysteria2.sh --port 8443 --obfs   # 详细参数见 README-hysteria2.md
+hy2 info
+```
+
+注意 Hysteria2 只有 UDP、没有 TCP 回退:安全组/防火墙必须放行 UDP,否则会出现「日志正常但客户端连不上」。
